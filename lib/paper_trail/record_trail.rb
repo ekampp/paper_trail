@@ -259,14 +259,18 @@ module PaperTrail
     end
 
     def record_create
-      @in_after_callback = true
-      return unless enabled?
-      versions_assoc = @record.send(@record.class.versions_association_name)
-      version = versions_assoc.create! data_for_create
-      update_transaction_id(version)
-      save_associations(version)
-    ensure
-      @in_after_callback = false
+      Thread.new do
+        begin
+          @in_after_callback = true
+          return unless enabled?
+          versions_assoc = @record.send(@record.class.versions_association_name)
+          version = versions_assoc.create! data_for_create
+          update_transaction_id(version)
+          save_associations(version)
+        ensure
+          @in_after_callback = false
+        end
+      end
     end
 
     # Returns data for record create
@@ -290,20 +294,24 @@ module PaperTrail
     #
     # @api private
     def record_destroy(recording_order)
-      @in_after_callback = recording_order == "after"
-      if enabled? && !@record.new_record?
-        version = @record.class.paper_trail.version_class.create(data_for_destroy)
-        if version.errors.any?
-          log_version_errors(version, :destroy)
-        else
-          @record.send("#{@record.class.version_association_name}=", version)
-          @record.send(@record.class.versions_association_name).reset
-          update_transaction_id(version)
-          save_associations(version)
+      Thread.new do
+        begin
+          @in_after_callback = recording_order == "after"
+          if enabled? && !@record.new_record?
+            version = @record.class.paper_trail.version_class.create(data_for_destroy)
+            if version.errors.any?
+              log_version_errors(version, :destroy)
+            else
+              @record.send("#{@record.class.version_association_name}=", version)
+              @record.send(@record.class.versions_association_name).reset
+              update_transaction_id(version)
+              save_associations(version)
+            end
+          end
+        ensure
+          @in_after_callback = false
         end
       end
-    ensure
-      @in_after_callback = false
     end
 
     # Returns data for record destroy
@@ -329,19 +337,23 @@ module PaperTrail
     end
 
     def record_update(force:, in_after_callback:)
-      @in_after_callback = in_after_callback
-      if enabled? && (force || changed_notably?)
-        versions_assoc = @record.send(@record.class.versions_association_name)
-        version = versions_assoc.create(data_for_update)
-        if version.errors.any?
-          log_version_errors(version, :update)
-        else
-          update_transaction_id(version)
-          save_associations(version)
+      Thread.new do
+        begin
+          @in_after_callback = in_after_callback
+          if enabled? && (force || changed_notably?)
+            versions_assoc = @record.send(@record.class.versions_association_name)
+            version = versions_assoc.create(data_for_update)
+            if version.errors.any?
+              log_version_errors(version, :update)
+            else
+              update_transaction_id(version)
+              save_associations(version)
+            end
+          end
+        ensure
+          @in_after_callback = false
         end
       end
-    ensure
-      @in_after_callback = false
     end
 
     # Used during `record_update`, returns a hash of data suitable for an AR
@@ -366,14 +378,16 @@ module PaperTrail
 
     # @api private
     def record_update_columns(changes)
-      return unless enabled?
-      versions_assoc = @record.send(@record.class.versions_association_name)
-      version = versions_assoc.create(data_for_update_columns(changes))
-      if version.errors.any?
-        log_version_errors(version, :update)
-      else
-        update_transaction_id(version)
-        save_associations(version)
+      Thread.new do
+        return unless enabled?
+        versions_assoc = @record.send(@record.class.versions_association_name)
+        version = versions_assoc.create(data_for_update_columns(changes))
+        if version.errors.any?
+          log_version_errors(version, :update)
+        else
+          update_transaction_id(version)
+          save_associations(version)
+        end
       end
     end
 
@@ -452,14 +466,16 @@ module PaperTrail
     # `VersionAssociation` records for each of the associated records.
     # @api private
     def save_habtm_associations(version)
-      @record.class.reflect_on_all_associations(:has_and_belongs_to_many).each do |a|
-        next unless save_habtm_association?(a)
-        habtm_assoc_ids(a).each do |id|
-          PaperTrail::VersionAssociation.create(
-            version_id: version.transaction_id,
-            foreign_key_name: a.name,
-            foreign_key_id: id
-          )
+      Thread.new do
+        @record.class.reflect_on_all_associations(:has_and_belongs_to_many).each do |a|
+          next unless save_habtm_association?(a)
+          habtm_assoc_ids(a).each do |id|
+            PaperTrail::VersionAssociation.create(
+              version_id: version.transaction_id,
+              foreign_key_name: a.name,
+              foreign_key_id: id
+            )
+          end
         end
       end
     end
@@ -656,22 +672,24 @@ module PaperTrail
     # Save a single `belongs_to` association.
     # @api private
     def save_bt_association(assoc, version)
-      assoc_version_args = {
-        version_id: version.id,
-        foreign_key_name: assoc.foreign_key
-      }
+      Thread.new do
+        assoc_version_args = {
+          version_id: version.id,
+          foreign_key_name: assoc.foreign_key
+        }
 
-      if assoc.options[:polymorphic]
-        associated_record = @record.send(assoc.name) if @record.send(assoc.foreign_type)
-        if associated_record && PaperTrail.request.enabled_for_model?(associated_record.class)
-          assoc_version_args[:foreign_key_id] = associated_record.id
+        if assoc.options[:polymorphic]
+          associated_record = @record.send(assoc.name) if @record.send(assoc.foreign_type)
+          if associated_record && PaperTrail.request.enabled_for_model?(associated_record.class)
+            assoc_version_args[:foreign_key_id] = associated_record.id
+          end
+        elsif PaperTrail.request.enabled_for_model?(assoc.klass)
+          assoc_version_args[:foreign_key_id] = @record.send(assoc.foreign_key)
         end
-      elsif PaperTrail.request.enabled_for_model?(assoc.klass)
-        assoc_version_args[:foreign_key_id] = @record.send(assoc.foreign_key)
-      end
 
-      if assoc_version_args.key?(:foreign_key_id)
-        PaperTrail::VersionAssociation.create(assoc_version_args)
+        if assoc_version_args.key?(:foreign_key_id)
+          PaperTrail::VersionAssociation.create(assoc_version_args)
+        end
       end
     end
 
